@@ -23,18 +23,19 @@ var reflectedXSSCmd = &cobra.Command{
 
 		payload := `<script>alert(1)</script>`
 
-		result, err := scanner.ReflectedXSS(httpClient, host, queryString, payload)
+		result, err := scanner.ReflectedXSS(browser, host, queryString, payload)
 		if err != nil {
 			return err
 		}
 
 		fmt.Printf("URL:        %s\n", result.URL)
 		fmt.Printf("Payload:    %s\n", result.Payload)
-		fmt.Printf("Status:     %d\n", result.StatusCode)
-		if result.Vulnerable {
+		if result.Executed {
+			fmt.Println("Result:     VULNERABLE — payload executed in the browser")
+		} else if result.Vulnerable {
 			fmt.Println("Result:     VULNERABLE — payload reflected unescaped")
 		} else {
-			fmt.Println("Result:     NOT VULNERABLE — payload not found or was escaped")
+			fmt.Println("Result:     NOT VULNERABLE — payload not found, escaped, or did not execute")
 		}
 
 		return nil

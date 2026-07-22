@@ -1,161 +1,171 @@
 package scanner
 
 import (
-	"bytes"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
-	"golang.org/x/net/html"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/go-rod/stealth"
 )
 
 type XSSResult struct {
 	URL        string
 	Payload    string
 	Vulnerable bool
-	StatusCode int
+	Executed   bool // true if the payload ran as script (a JS dialog fired), not just reflected in the DOM
 }
 
-func ReflectedXSS(client *http.Client, host, queryParam, payload string) (*XSSResult, error) {
+// ReflectedXSS loads the target URL in a real (stealth-patched) Chrome tab and checks
+// whether the payload executes. Using an actual browser instead of matching the raw HTTP
+// response means the check reflects what a real visitor's browser would do: encoded output
+// that a naive string search might miss as "safe" won't execute, and DOM-rewritten output
+// that a raw body scan would miss as "safe" will still trigger the dialog.
+func ReflectedXSS(browser *rod.Browser, host, queryParam, payload string) (*XSSResult, error) {
 	target := fmt.Sprintf("https://%s/?%s=%s", host, queryParam, url.QueryEscape(payload))
 
-	resp, err := client.Get(target)
+	page, err := stealth.Page(browser)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer page.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	executed, err := navigateAndWatchForDialog(page, target)
 	if err != nil {
 		return nil, err
 	}
 
-	// Look for the raw unescaped payload — if the server HTML-encoded it
-	// (e.g. &lt;script&gt;) this check fails, meaning the input is sanitised.
-	vulnerable := strings.Contains(string(body), payload)
+	html, err := page.HTML()
+	if err != nil {
+		return nil, err
+	}
 
 	return &XSSResult{
 		URL:        target,
 		Payload:    payload,
-		Vulnerable: vulnerable,
-		StatusCode: resp.StatusCode,
+		Executed:   executed,
+		Vulnerable: executed || strings.Contains(html, payload),
 	}, nil
 }
 
 type StoredXSSResult struct {
-	PostURL    string
+	FormURL    string
 	VerifyURL  string
 	Payload    string
-	CSRFToken  string
-	PostStatus int
-	Vulnerable bool
 	Verified   bool
+	Executed   bool
+	Vulnerable bool
 }
 
-func StoredXSS(client *http.Client, host, path, attackField, payload string, fields map[string]string, verifyPath, csrfFrom, csrfField string) (*StoredXSSResult, error) {
+// StoredXSS navigates to the page that hosts the target form, fills it out like a real user
+// (so any CSRF token or client-side validation already on the page is handled for us by the
+// browser instead of us having to scrape and replay it), submits it, then reloads the verify
+// page to confirm whether the payload persisted and executes.
+func StoredXSS(browser *rod.Browser, host, formPath, attackField, payload string, fields map[string]string, submitSelector, verifyPath string) (*StoredXSSResult, error) {
 	result := &StoredXSSResult{
-		PostURL: fmt.Sprintf("https://%s%s", host, path),
+		FormURL: fmt.Sprintf("https://%s%s", host, formPath),
 		Payload: payload,
 	}
 
-	form := url.Values{}
-	for k, v := range fields {
-		form.Set(k, v)
-	}
-
-	if csrfFrom != "" {
-		csrfURL := fmt.Sprintf("https://%s%s", host, csrfFrom)
-		token, err := fetchCSRFToken(client, csrfURL, csrfField)
-		if err != nil {
-			return nil, fmt.Errorf("CSRF fetch failed: %w", err)
-		}
-		result.CSRFToken = token
-		form.Set(csrfField, token)
-	}
-
-	form.Set(attackField, payload)
-
-	resp, err := client.PostForm(result.PostURL, form)
+	page, err := stealth.Page(browser)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	io.ReadAll(resp.Body) // drain so the connection can be reused
+	defer page.Close()
 
-	result.PostStatus = resp.StatusCode
+	if err := page.Navigate(result.FormURL); err != nil {
+		return nil, err
+	}
+	if err := page.WaitLoad(); err != nil {
+		return nil, err
+	}
+
+	for name, value := range fields {
+		el, err := page.Element(fmt.Sprintf(`[name=%q]`, name))
+		if err != nil {
+			return nil, fmt.Errorf("field %q not found: %w", name, err)
+		}
+		if err := el.Input(value); err != nil {
+			return nil, err
+		}
+	}
+
+	attackEl, err := page.Element(fmt.Sprintf(`[name=%q]`, attackField))
+	if err != nil {
+		return nil, fmt.Errorf("attack field %q not found: %w", attackField, err)
+	}
+	if err := attackEl.Input(payload); err != nil {
+		return nil, err
+	}
+
+	if submitSelector != "" {
+		submitEl, err := page.Element(submitSelector)
+		if err != nil {
+			return nil, fmt.Errorf("submit element %q not found: %w", submitSelector, err)
+		}
+		if err := submitEl.Click(proto.InputMouseButtonLeft, 1); err != nil {
+			return nil, err
+		}
+	} else if _, err := attackEl.Eval(`() => this.form && this.form.requestSubmit()`); err != nil {
+		return nil, err
+	}
+
+	if err := page.WaitStable(time.Second); err != nil {
+		return nil, err
+	}
 
 	if verifyPath == "" {
 		return result, nil
 	}
 
-	verifyURL := fmt.Sprintf("https://%s%s", host, verifyPath)
-	result.VerifyURL = verifyURL
 	result.Verified = true
+	result.VerifyURL = fmt.Sprintf("https://%s%s", host, verifyPath)
 
-	vresp, err := client.Get(verifyURL)
+	executed, err := navigateAndWatchForDialog(page, result.VerifyURL)
 	if err != nil {
-		return result, fmt.Errorf("post succeeded but verify GET failed: %w", err)
+		return result, fmt.Errorf("submit succeeded but verify navigation failed: %w", err)
 	}
-	defer vresp.Body.Close()
 
-	body, err := io.ReadAll(vresp.Body)
+	html, err := page.HTML()
 	if err != nil {
 		return result, err
 	}
 
-	// Same check as reflected: raw unescaped payload present means the stored
-	// content is rendered without sanitisation.
-	result.Vulnerable = strings.Contains(string(body), payload)
+	result.Executed = executed
+	result.Vulnerable = executed || strings.Contains(html, payload)
 
 	return result, nil
 }
 
-// fetchCSRFToken GETs the given URL and walks the HTML tree to find the value
-// of the hidden input whose name matches fieldName.
-func fetchCSRFToken(client *http.Client, pageURL, fieldName string) (string, error) {
-	resp, err := client.Get(pageURL)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+// navigateAndWatchForDialog navigates page to target while concurrently watching for a JS
+// dialog (alert/confirm/prompt) triggered during load. A dialog blocks the page's "load" event
+// until dismissed, so the watch has to run in its own goroutine alongside the navigation rather
+// than after it. If no dialog appears within the timeout, the wait naturally falls through with
+// a zero-value event rather than blocking forever.
+func navigateAndWatchForDialog(page *rod.Page, target string) (executed bool, err error) {
+	timedPage := page.Timeout(10 * time.Second)
+	wait, handle := timedPage.HandleDialog()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
+	navErr := make(chan error, 1)
+	go func() { navErr <- page.Navigate(target) }()
 
-	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-
-	var token string
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "input" {
-			var name, value string
-			for _, a := range n.Attr {
-				switch a.Key {
-				case "name":
-					name = a.Val
-				case "value":
-					value = a.Val
-				}
-			}
-			if name == fieldName {
-				token = value
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+	dialog := wait()
+	executed = dialog.Type != ""
+	if executed {
+		if hErr := handle(&proto.PageHandleJavaScriptDialog{Accept: true}); hErr != nil {
+			return executed, hErr
 		}
 	}
-	walk(doc)
 
-	if token == "" {
-		return "", fmt.Errorf("field %q not found in %s", fieldName, pageURL)
+	if err := <-navErr; err != nil {
+		return executed, err
 	}
-	return token, nil
+
+	if err := page.WaitLoad(); err != nil {
+		return executed, err
+	}
+
+	return executed, nil
 }
