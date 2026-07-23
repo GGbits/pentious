@@ -18,13 +18,22 @@ type XSSResult struct {
 	Executed   bool // true if the payload ran as script (a JS dialog fired), not just reflected in the DOM
 }
 
-// ReflectedXSS loads the target URL in a real (stealth-patched) Chrome tab and checks
-// whether the payload executes. Using an actual browser instead of matching the raw HTTP
-// response means the check reflects what a real visitor's browser would do: encoded output
-// that a naive string search might miss as "safe" won't execute, and DOM-rewritten output
-// that a raw body scan would miss as "safe" will still trigger the dialog.
-func ReflectedXSS(browser *rod.Browser, host, queryParam, payload string) (*XSSResult, error) {
-	target := fmt.Sprintf("https://%s/?%s=%s", host, queryParam, url.QueryEscape(payload))
+// ReflectedXSSAtURL loads rawURL with queryParam set to payload in a real (stealth-patched)
+// Chrome tab and checks whether the payload executes. Using an actual browser instead of
+// matching the raw HTTP response means the check reflects what a real visitor's browser would
+// do: encoded output that a naive string search might miss as "safe" won't execute, and
+// DOM-rewritten output that a raw body scan would miss as "safe" will still trigger the dialog.
+// Any existing value for queryParam on rawURL is overwritten rather than duplicated, which is
+// the correct behavior when testing a param discovered with an existing value (e.g. "?id=3").
+func ReflectedXSSAtURL(browser *rod.Browser, rawURL, queryParam, payload string) (*XSSResult, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid target URL %q: %w", rawURL, err)
+	}
+	q := u.Query()
+	q.Set(queryParam, payload)
+	u.RawQuery = q.Encode()
+	target := u.String()
 
 	page, err := stealth.Page(browser)
 	if err != nil {
@@ -48,6 +57,12 @@ func ReflectedXSS(browser *rod.Browser, host, queryParam, payload string) (*XSSR
 		Executed:   executed,
 		Vulnerable: executed || strings.Contains(html, payload),
 	}, nil
+}
+
+// ReflectedXSS tests queryParam on host's root path "/" — kept for the existing reflected-xss
+// CLI command's sake. Prefer ReflectedXSSAtURL for testing a param discovered on an arbitrary path.
+func ReflectedXSS(browser *rod.Browser, host, queryParam, payload string) (*XSSResult, error) {
+	return ReflectedXSSAtURL(browser, fmt.Sprintf("https://%s/", host), queryParam, payload)
 }
 
 type StoredXSSResult struct {
@@ -142,14 +157,25 @@ func StoredXSS(browser *rod.Browser, host, formPath, attackField, payload string
 // navigateAndWatchForDialog navigates page to target while concurrently watching for a JS
 // dialog (alert/confirm/prompt) triggered during load. A dialog blocks the page's "load" event
 // until dismissed, so the watch has to run in its own goroutine alongside the navigation rather
-// than after it. If no dialog appears within the timeout, the wait naturally falls through with
+// than after it. If no dialog appears within dialogTimeout, the wait naturally falls through with
 // a zero-value event rather than blocking forever.
+//
+// The navigate+load itself gets its own, more generous bound (navTimeout): dialog detection and
+// page loading are independent concerns, and without a separate bound here, a page that hangs for
+// any non-dialog reason (a stuck resource load, an unresponsive backend call) would block forever
+// on <-navErr once the dialog wait has already returned — this exact class of bug was found and
+// fixed for the crawler's own navigation calls, and it applies here too since this helper backs
+// every automatic reflected-xss check the crawler runs.
 func navigateAndWatchForDialog(page *rod.Page, target string) (executed bool, err error) {
-	timedPage := page.Timeout(10 * time.Second)
-	wait, handle := timedPage.HandleDialog()
+	const dialogTimeout = 10 * time.Second
+	const navTimeout = 30 * time.Second
 
+	dialogPage := page.Timeout(dialogTimeout)
+	wait, handle := dialogPage.HandleDialog()
+
+	navPage := page.Timeout(navTimeout)
 	navErr := make(chan error, 1)
-	go func() { navErr <- page.Navigate(target) }()
+	go func() { navErr <- navPage.Navigate(target) }()
 
 	dialog := wait()
 	executed = dialog.Type != ""
@@ -163,7 +189,7 @@ func navigateAndWatchForDialog(page *rod.Page, target string) (executed bool, er
 		return executed, err
 	}
 
-	if err := page.WaitLoad(); err != nil {
+	if err := navPage.WaitLoad(); err != nil {
 		return executed, err
 	}
 
