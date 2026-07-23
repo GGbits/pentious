@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // clickCandidatesJS finds elements that look clickable-and-meaningful without relying on an
@@ -104,20 +103,23 @@ func discoverClickNav(page *rod.Page, originalURL, base *url.URL, opts CrawlOpti
 		}
 
 		logf("click-nav: clicking %q", text)
-		if err := target.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		// A JS-dispatched click (this.click()) rather than rod's real mouse-coordinate-simulated
+		// Element.Click() -- simpler, and avoids any dependency on the element's exact on-screen
+		// position/visibility.
+		if _, err := target.Eval(`() => this.click()`); err != nil {
 			logf("click-nav: click on %q failed: %v", text, err)
 			continue // element may have gone stale between the query and the click; skip it
 		}
-		time.Sleep(500 * time.Millisecond)
 
-		logf("click-nav: reading page info after clicking %q", text)
-		info, err := page.Info()
+		// Poll for a URL change instead of a single fixed sleep-then-check: confirmed against
+		// the real target that some nav entries take over a second to actually navigate (likely
+		// fetching data before committing the route change) while most navigate near-instantly.
+		// A short fixed wait was mistakenly concluding "did not navigate" on exactly the slower
+		// entries, silently missing real destinations. Polling lets fast entries proceed quickly
+		// while still giving slow ones enough time.
+		afterURL, err := pollForURLChange(page, originalURL, clickNavWaitTimeout, clickNavPollInterval)
 		if err != nil {
-			logf("click-nav: page.Info() after clicking %q failed: %v", text, err)
-			continue
-		}
-		afterURL, err := url.Parse(info.URL)
-		if err != nil {
+			logf("click-nav: reading page info after clicking %q failed: %v", text, err)
 			continue
 		}
 
@@ -162,6 +164,39 @@ func discoverClickNav(page *rod.Page, originalURL, base *url.URL, opts CrawlOpti
 	}
 
 	return discovered
+}
+
+const (
+	clickNavPollInterval = 250 * time.Millisecond
+	// clickNavWaitTimeout is generous on purpose: these are IoT/embedded devices that prioritize
+	// camera recording/viewing over web responsiveness, so a route change can take noticeably
+	// longer than on typical web infrastructure -- confirmed against a real device that some nav
+	// entries take over a second already; 10s gives real headroom under heavier device load.
+	clickNavWaitTimeout = 10 * time.Second
+)
+
+// pollForURLChange polls the page's current URL every interval, returning as soon as it differs
+// from originalURL, or the current URL once timeout elapses with no change (a non-navigating
+// click, or a still-in-flight one slower than we're willing to wait for).
+func pollForURLChange(page *rod.Page, originalURL *url.URL, timeout, interval time.Duration) (*url.URL, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		info, err := page.Info()
+		if err != nil {
+			return nil, err
+		}
+		current, err := url.Parse(info.URL)
+		if err != nil {
+			return nil, err
+		}
+		if normalize(current) != normalize(originalURL) {
+			return current, nil
+		}
+		if time.Now().After(deadline) {
+			return current, nil
+		}
+		time.Sleep(interval)
+	}
 }
 
 // nextUntried returns the first candidate whose trimmed visible text hasn't been tried yet.
