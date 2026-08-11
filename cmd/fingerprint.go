@@ -57,6 +57,9 @@ var fingerprintCmd = &cobra.Command{
 			}
 		}
 
+		fmt.Println()
+		printSignatureMatches(malformed)
+
 		return nil
 	},
 }
@@ -67,4 +70,34 @@ func init() {
 	fingerprintCmd.MarkFlagRequired("host")
 
 	rootCmd.AddCommand(fingerprintCmd)
+}
+
+// printSignatureMatches scores the malformed-request probe response against every known server
+// signature and prints each one's checklist, so the conclusion is traceable to the factors that
+// drove it rather than just asserted.
+func printSignatureMatches(malformed *fingerprint.MalformedResult) {
+	matches := fingerprint.IdentifyServer(malformed)
+	if len(matches) == 0 {
+		return
+	}
+
+	fmt.Println("Signature matches:")
+	for _, m := range matches {
+		fmt.Printf("\n%s (%d/%d factors matched):\n", m.Signature, m.MatchedCount(), m.Total())
+		for _, r := range m.Results {
+			mark := "[ ]"
+			if r.Matched {
+				mark = "[x]"
+			}
+			fmt.Printf("  %s %s\n", mark, r.Name)
+		}
+	}
+
+	best := matches[0]
+	fmt.Println()
+	if best.MatchedCount() == 0 {
+		fmt.Println("Best guess:  none -- no known server signature matched")
+		return
+	}
+	fmt.Printf("Best guess:  %s (%d/%d factors matched)\n", best.Signature, best.MatchedCount(), best.Total())
 }
