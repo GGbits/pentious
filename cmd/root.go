@@ -18,6 +18,10 @@ var rootCmd = &cobra.Command{
 	Use:   "pentious",
 	Short: "Web security testing tool",
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		if cmd.Annotations["skipBrowser"] == "true" {
+			return
+		}
+
 		l := launcher.New().Headless(headless).Leakless(false)
 		if insecure {
 			l = l.Set("ignore-certificate-errors")
