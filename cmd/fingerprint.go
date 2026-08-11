@@ -42,6 +42,7 @@ var fingerprintCmd = &cobra.Command{
 			fmt.Printf("Malformed request probe failed: %v\n", err)
 			return nil
 		}
+		malformed.NormalAltSvc = result.Headers.Get("Alt-Svc")
 
 		fmt.Printf("Status:     %s\n", malformed.StatusLine)
 		if errServer := malformed.Headers.Get("Server"); errServer != "" {

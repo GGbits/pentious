@@ -44,6 +44,10 @@ func FingerprintURL(rawURL string, insecure bool) (*Result, error) {
 		Timeout: requestTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+			// Supplying a custom TLSClientConfig otherwise makes net/http conservatively skip
+			// its automatic HTTP/2 upgrade. Some fingerprint checks (e.g. Jetty's Alt-Svc/h3
+			// advertisement) only fire on HTTP/2 connections, so force the attempt here.
+			ForceAttemptHTTP2: true,
 		},
 	}
 
@@ -65,6 +69,12 @@ type MalformedResult struct {
 	Headers    http.Header
 	Body       string
 	Truncated  bool
+
+	// NormalAltSvc is the Alt-Svc header value from the earlier normal (non-malformed) request,
+	// if any. It's not populated by MalformedRequest itself -- the caller sets it from the
+	// Result it already has, since re-requesting it here would be redundant. Some signature
+	// checks use it alongside the malformed-request body.
+	NormalAltSvc string
 }
 
 // MalformedRequest connects to host:port and sends a request line with an invalid HTTP version,
