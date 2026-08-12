@@ -165,6 +165,25 @@ var signatures = []Signature{
 					return strings.Contains(r.Body, ".line {height:1px;background-color:#525D76;border:none;}")
 				},
 			},
+			{
+				// Unlike Jetty, Tomcat's ErrorReportValve.report() method, its TomcatCSS
+				// constant, and the "errorReportValve.statusHeader" message wording are all
+				// byte-for-byte identical across the latest patch of every major line from
+				// 7.0.109 through 11.0.24 -- there's no equivalent body-layout split to key on.
+				// The one real version-adjacent signal available: org.apache.coyote.http2.Http2Protocol
+				// doesn't exist at all in the tomcat-7.0 line (confirmed: no such file in that
+				// tag), while 8.5.100 through 11.0.24 all ship it wired up as the HTTPS
+				// connector's UpgradeProtocol directly in the default conf/server.xml template.
+				// So a negotiated HTTP/2 connection weighs against Tomcat 7.0 specifically.
+				// It's still just a shipped default, not a guarantee -- a reverse proxy in front
+				// of Tomcat, a stripped-down connector config, or plain old Java without ALPN
+				// support can all suppress HTTP/2 on a genuinely newer Tomcat -- so its absence
+				// doesn't rule anything out.
+				Name: `the normal request negotiated HTTP/2 -- Tomcat has had no HTTP/2 support at all in the 7.0 line (org.apache.coyote.http2.Http2Protocol doesn't exist there), while 8.5 through 11.0 ship it wired into the default server.xml's HTTPS connector, so a match here weighs against 7.0 specifically`,
+				Matches: func(r *MalformedResult) bool {
+					return r.NormalProto == "HTTP/2.0"
+				},
+			},
 		},
 	},
 }

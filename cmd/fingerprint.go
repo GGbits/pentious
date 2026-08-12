@@ -43,6 +43,7 @@ var fingerprintCmd = &cobra.Command{
 			return nil
 		}
 		malformed.NormalAltSvc = result.Headers.Get("Alt-Svc")
+		malformed.NormalProto = result.Proto
 
 		fmt.Printf("Status:     %s\n", malformed.StatusLine)
 		if errServer := malformed.Headers.Get("Server"); errServer != "" {

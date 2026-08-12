@@ -25,10 +25,12 @@ const malformedRequestTemplate = "GET / HTTP/1.1.1\r\nHost: %s\r\n\r\n"
 
 // Result holds the response metadata from a fingerprint request. Headers is the full response
 // header set, not just Server -- v1 only surfaces Server, but later fingerprinting phases can
-// read Headers directly without a signature change here.
+// read Headers directly without a signature change here. Proto is the negotiated protocol (e.g.
+// "HTTP/2.0" or "HTTP/1.1") -- some signature checks use whether HTTP/2 was negotiated at all.
 type Result struct {
 	URL     string
 	Headers http.Header
+	Proto   string
 }
 
 // Fingerprint requests host's root path "/" over HTTPS on the given port and reports its
@@ -57,7 +59,7 @@ func FingerprintURL(rawURL string, insecure bool) (*Result, error) {
 	}
 	defer resp.Body.Close()
 
-	return &Result{URL: rawURL, Headers: resp.Header}, nil
+	return &Result{URL: rawURL, Headers: resp.Header, Proto: resp.Proto}, nil
 }
 
 // MalformedResult holds the response to a deliberately malformed HTTP request, sent as a
@@ -75,6 +77,10 @@ type MalformedResult struct {
 	// Result it already has, since re-requesting it here would be redundant. Some signature
 	// checks use it alongside the malformed-request body.
 	NormalAltSvc string
+
+	// NormalProto is the negotiated protocol (Result.Proto) from that same earlier normal
+	// request, set by the caller the same way as NormalAltSvc.
+	NormalProto string
 }
 
 // MalformedRequest connects to host:port and sends a request line with an invalid HTTP version,
